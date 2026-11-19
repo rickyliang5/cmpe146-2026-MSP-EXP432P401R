@@ -317,6 +317,25 @@ private:
 };
 
 /**
+ * @brief Split a temperature in 0.1 degC units into printable parts.
+ *
+ * newlib-nano's printf has no %f, so print as "%s%ld.%ld degC" with
+ * sign, whole and tenth: 268 -> "26.8", -5 -> "-0.5".
+ */
+struct printable_temperature
+{
+  char const* sign;
+  long whole;
+  long tenth;
+};
+
+printable_temperature to_printable(std::int32_t p_tenths)
+{
+  std::int32_t const magnitude = p_tenths < 0 ? -p_tenths : p_tenths;
+  return { p_tenths < 0 ? "-" : "", magnitude / 10, magnitude % 10 };
+}
+
+/**
  * @brief Convert one 16-bit upscaled TMP36 sample to 0.1 degC units.
  *
  * The ADC code is first turned into millivolts at the TMP36's VOUT pin
@@ -706,8 +725,24 @@ void transmit_task(void* p_parameters)
                  to_microseconds(software_ticks, frequency),
                  hardware_checksum == software_checksum ? "match"
                                                         : "MISMATCH");
-    debug_printf("batch: first sample = %d (0.1 degC units)\n",
-                 static_cast<int>(samples.front()));
+    {
+      std::int32_t sum = 0;
+      for (auto const sample : samples) {
+        sum += sample;
+      }
+      auto const first = to_printable(samples.front());
+      auto const average =
+        to_printable(sum / static_cast<std::int32_t>(samples_per_batch));
+      debug_printf("batch: first = %s%ld.%ld degC, average of %u = %s%ld.%ld "
+                   "degC\n",
+                   first.sign,
+                   first.whole,
+                   first.tenth,
+                   static_cast<unsigned>(samples_per_batch),
+                   average.sign,
+                   average.whole,
+                   average.tenth);
+    }
 
     // 3. The packet uses the software CRC. Corrupt the data only after the
     //    CRC is saved, so the display board sees a mismatch.
@@ -840,8 +875,11 @@ void display_task(void* p_parameter)
       sum += sample;
     }
     std::int32_t const average = sum / std::int32_t{ samples_per_batch };
-    debug_printf("average = %ld (0.1 degC units)\n",
-                 static_cast<long>(average));
+    auto const shown = to_printable(average);
+    debug_printf("average = %s%ld.%ld degC\n",
+                 shown.sign,
+                 shown.whole,
+                 shown.tenth);
 
     if (average < warm_tenths) {
       set_color(false, false, true);  // blue: cold
