@@ -121,7 +121,7 @@ constexpr device_role this_device = device_role::sensor;
 // no display board. The packet itself is not transmitted in this mode,
 // because any 0xA5 byte inside it would loop back as a fake request.
 // Must be false for normal two-board operation.
-constexpr bool loopback_test = false;
+constexpr bool loopback_test = true;
 
 // SystemInit leaves MCLK and SMCLK at 3 MHz. The UART baud rate, the ADC
 // sample time and the benchmark clock all assume this.
