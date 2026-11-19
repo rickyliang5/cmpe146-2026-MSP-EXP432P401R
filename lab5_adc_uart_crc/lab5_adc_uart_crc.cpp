@@ -113,7 +113,7 @@ enum class device_role : std::uint8_t
 };
 
 // Change this before building each board.
-constexpr device_role this_device = device_role::sensor;
+constexpr device_role this_device = device_role::display;
 
 // Single-board test of the sensor role. Set to true, jumper J1.4 (TX) to
 // J1.3 (RX) on the sensor board, and rebuild: a test task then sends the
