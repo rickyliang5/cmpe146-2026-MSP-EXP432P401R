@@ -121,7 +121,7 @@ constexpr device_role this_device = device_role::sensor;
 // no display board. The packet itself is not transmitted in this mode,
 // because any 0xA5 byte inside it would loop back as a fake request.
 // Must be false for normal two-board operation.
-constexpr bool loopback_test = true;
+constexpr bool loopback_test = false;
 
 // SystemInit leaves MCLK and SMCLK at 3 MHz. The UART baud rate, the ADC
 // sample time and the benchmark clock all assume this.
@@ -139,7 +139,7 @@ constexpr std::uint32_t system_clock_hz = 3'000'000;
 
 // The one-byte message the display board sends to ask the sensor board for
 // a fresh batch of readings.
-constexpr std::uint8_t sample_request_command = 0xA5;
+constexpr std::uint8_t sample_request_command = 0xA5; // value sent over UART to be passed through eUSCI_A2 UART's data registers
 
 constexpr std::size_t samples_per_batch = 64;
 
@@ -150,8 +150,11 @@ constexpr std::size_t sample_bytes = sizeof(temperature_batch);
 constexpr std::size_t crc_size = sizeof(std::uint32_t);
 constexpr std::size_t packet_size = sample_bytes + crc_size;
 
-/// How long the display board waits for a reply before giving up.
-constexpr TickType_t reply_timeout = pdMS_TO_TICKS(500);
+/// How long the display board waits for a reply before giving up. The
+/// sensor's semihosting printfs (debugger attached) can delay its reply by
+/// several hundred ms, so this leaves plenty of margin over the ~140 ms
+/// the 132-byte packet itself takes at 9600 baud.
+constexpr TickType_t reply_timeout = pdMS_TO_TICKS(2000);
 
 /// LED color bands, in 0.1 degC: below 20.0 is cold, below 28.0 is warm.
 constexpr std::int32_t warm_tenths = 200;
@@ -571,17 +574,17 @@ private:
 
 // request_task -> sampler_task: binary semaphore, carries no data, only
 // "take a batch now".
-StaticSemaphore_t sample_request_storage;
-SemaphoreHandle_t sample_request = nullptr;
+StaticSemaphore_t sample_request_storage; // reserves RAM for semaphore's memory
+SemaphoreHandle_t sample_request = nullptr; // name the task uses for the semaphore (empty until main creates it)
 
 // sampler_task -> transmit_task: one slot holding a full copy of 64
 // converted samples.
-constexpr UBaseType_t batch_queue_length = 1;
-StaticQueue_t batch_queue_control;
-alignas(temperature_batch)
-  std::array<std::uint8_t, batch_queue_length * sizeof(temperature_batch)>
-    batch_queue_storage{};
-QueueHandle_t batch_queue = nullptr;
+constexpr UBaseType_t batch_queue_length = 1; // sets batch queue to 1 slot
+StaticQueue_t batch_queue_control; // reserves RAM for queue's memory
+alignas(temperature_batch) // makes buffer start at an even address (multiple of 3)
+  std::array<std::uint8_t, batch_queue_length * sizeof(temperature_batch)> // declares fixed size array of raw bytes (64 reading * 2 = 128 bytes) 
+    batch_queue_storage{}; // name of 128 byte array that holds queues contents
+QueueHandle_t batch_queue = nullptr; // names the handle task for the queue, starts out as nothing 
 
 // =============================================================================
 // Sensor board: tasks
@@ -591,57 +594,58 @@ QueueHandle_t batch_queue = nullptr;
 // sample_request semaphore. Only reads from the serial port.
 void request_task(void* p_parameter)
 {
-  auto& port = *static_cast<lab6::serial*>(p_parameter);
-  auto const buffer = port.receive_buffer();
+  auto& port = *static_cast<lab6::serial*>(p_parameter); // turns the generic parameter back into UART object
+  auto const buffer = port.receive_buffer(); //gets read only access to the 256 byte buffer the UART interrupt fills
   // Start from the current position: ignore anything received before startup.
-  std::size_t last_cursor = port.receive_cursor();
+  std::size_t last_cursor = port.receive_cursor(); // remebers where new data will start, ignoring anything older
 
   while (true) {
-    std::size_t const cursor = port.receive_cursor();
+    std::size_t const cursor = port.receive_cursor(); // checking where in the recive buffer the UART has written
     // Walk every new byte, wrapping around the circular buffer.
-    while (last_cursor != cursor) {
-      if (buffer[last_cursor] == sample_request_command) {
-        if (xSemaphoreGive(sample_request) == pdTRUE) {
-          debug_requests_received = debug_requests_received + 1;
-          debug_printf("request: sample request received\n");
+    while (last_cursor != cursor) { // checks each new byte in buffer until UART position
+      if (buffer[last_cursor] == sample_request_command) { // is the byte a command request?
+        if (xSemaphoreGive(sample_request) == pdTRUE) { // raise the flag to wake sampler_task; false if a request is already pending
+          debug_requests_received = debug_requests_received + 1; // record request was accepted
+          debug_printf("request: sample request received\n"); 
         } else {
           // Count already 1: a batch is pending, so this request merges with it.
-          debug_requests_merged = debug_requests_merged + 1;
+          debug_requests_merged = debug_requests_merged + 1; // flag is already raised so count the request as merged with earlier waiting request
           debug_printf("request: batch already pending, request merged\n");
         }
       }
-      last_cursor = (last_cursor + 1) % buffer.size();
+      last_cursor = (last_cursor + 1) % buffer.size(); // move to next byt in buffer
+      // ^^ wraps from slot 255 to 0
     }
     // 5 ms poll: at 9600 baud the 256-byte buffer takes ~266 ms to lap.
-    vTaskDelay(pdMS_TO_TICKS(5));
+    vTaskDelay(pdMS_TO_TICKS(5)); // sleep for 5ms so other task can run
   }
 }
 
 // Waits for a request, takes one batch of samples in a single DMA transfer,
 // converts them to temperatures, and hands a copy to transmit_task.
-void sampler_task(void* p_parameter)
+void sampler_task(void* p_parameter) // function that waits for sample request, then takes 1 batch and queues it 
 {
-  auto& adc = *static_cast<lab5::adc16_stream*>(p_parameter);
-  std::array<std::uint16_t, samples_per_batch> raw{};
-  temperature_batch samples{};
+  auto& adc = *static_cast<lab5::adc16_stream*>(p_parameter); // turns parameter into ADC object
+  std::array<std::uint16_t, samples_per_batch> raw{}; // creates array of 64 raw 16 bit ADC readings
+  temperature_batch samples{}; // creates array for converted temperature samples
 
   while (true) {
-    if (xSemaphoreTake(sample_request, portMAX_DELAY) != pdTRUE) {
-      continue;
+    if (xSemaphoreTake(sample_request, portMAX_DELAY) != pdTRUE) { // sampler sleep until the flag is raised, then lower it
+    // portMAX_DELAY = time out that means "wait forever"
+      continue; // jumps back to top of loop
     }
 
-    adc.read(raw);
-    for (std::size_t i = 0; i < samples_per_batch; ++i) {
-      samples[i] = to_temperature(raw[i]);
+    adc.read(raw); // takes 64 ADC samples in 1 DMA transfer
+    for (std::size_t i = 0; i < samples_per_batch; ++i) { // loop over all 64 samples
+      samples[i] = to_temperature(raw[i]); // converts each raw sample to tenths of degree
     }
 
-    // Copies the whole array into the queue; samples can be reused right away.
+    // copies the 64 temperature samples into the queue for transmit_task (waits if the queue is full)
     xQueueSend(batch_queue, &samples, portMAX_DELAY);
-  }
-}
+  } // end of while (true)
+} // end of sampler_task
 
-/// Objects transmit_task uses that are constructed in main().
-struct transmit_task_parameters
+struct transmit_task_parameters // bundles 3 objects transmit task need into one parameter 
 {
   /// UART to the display board. transmit_task only writes to it.
   lab6::serial* serial;
@@ -660,6 +664,8 @@ struct transmit_task_parameters
  *
  * @return std::uint64_t - elapsed time in p_clock ticks
  */
+
+ // CRC benchmark helpers 
 std::uint64_t time_crc(lab6::crc32& p_crc,
                        std::span<std::uint8_t const> p_data,
                        lab2::steady_clock& p_clock)
@@ -684,28 +690,27 @@ unsigned long to_microseconds(std::uint64_t p_ticks, std::uint32_t p_frequency)
 
 // Waits for a batch, computes and benchmarks both CRCs, and sends the packet.
 // Only writes to the serial port.
-void transmit_task(void* p_parameters)
+void transmit_task(void* p_parameters) // waits for a batch, computes and times both CRCs, then sends samples + CRC over UART
 {
   auto const& parameters =
-    *static_cast<transmit_task_parameters const*>(p_parameters);
+    *static_cast<transmit_task_parameters const*>(p_parameters); // turns the void* back into the struct holding the UART, clock and button
 
-  auto& serial = *parameters.serial;
-  auto& clock = *parameters.clock;
-  auto& corruption_button = *parameters.corruption_button;
+  auto& serial = *parameters.serial; // sets UART from struct to send packets
+  auto& clock = *parameters.clock; // gets clock for strcut to time both CRC's
+  auto& corruption_button = *parameters.corruption_button; // Gets S1 button from struct to corrupt packet when held
 
   // Only this task uses the CRCs, so they live on its stack.
   msp432_crc32_hardware hardware_crc;
   crc32_software software_crc;
 
-  temperature_batch samples{};
-  // The CRC covers exactly the bytes sent, so view the samples as bytes once.
+  temperature_batch samples{}; // buffer for 1 recieved batch
+// views the 64 samples as 128 raw bytes so the CRC and UART can use them
   std::span<std::uint8_t const> const sample_view(
     reinterpret_cast<std::uint8_t const*>(samples.data()), sizeof(samples));
 
-  while (true) {
-    // 1. Wait for sampler_task's next batch.
-    if (xQueueReceive(batch_queue, &samples, portMAX_DELAY) != pdPASS) {
-      continue;
+  while (true) {// loop forever, one batch per pass
+    if (xQueueReceive(batch_queue, &samples, portMAX_DELAY) != pdPASS) { // sleep until a batch is in the queue, then copy it into samples
+      continue; // recieve failed and go back & wait 
     }
 
     // 2. Compute the CRC both ways, time each, and compare.
@@ -764,24 +769,24 @@ void transmit_task(void* p_parameters)
       serial.write(crc_bytes);
     }
 
-    debug_batches_sent = debug_batches_sent + 1;
+    debug_batches_sent = debug_batches_sent + 1; // count batch as sent
   }
 }
 
 // TEST ONLY: with J1.4 jumpered to J1.3, sends a request byte every 2 s so
 // the whole sensor pipeline can be exercised on one board. Created only when
 // loopback_test is true.
-void loopback_request_task(void* p_parameter)
+void loopback_request_task(void* p_parameter) // function that pretents to be display board 
 {
-  auto& port = *static_cast<lab6::serial*>(p_parameter);
-  std::array<std::uint8_t, 1> const command{ sample_request_command };
+  auto& port = *static_cast<lab6::serial*>(p_parameter); // turns void* parameter back into UART objecct
+  std::array<std::uint8_t, 1> const command{ sample_request_command }; // 1 byte message holding 0xA5 to send as fake request
 
-  while (true) {
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    debug_printf("loopback: sending request\n");
-    port.write(command);
-  }
-}
+  while (true) {// loop forever, sending one fake request every 2s
+    vTaskDelay(pdMS_TO_TICKS(2000)); // sleep for 2s
+    debug_printf("loopback: sending request\n"); // print that request has been sent
+    port.write(command); // send 0xA5 out TX, which loops back to RX through the jumper
+  } // end of while (true)
+} // end of loopback_request_task
 
 // =============================================================================
 // Display board: task
@@ -910,31 +915,33 @@ void blinker_task(void*)
 // Each task has its own stack and TCB. 512 words or more where semihosting
 // printf runs (newlib printf is stack-hungry). Raise these if a task trips
 // vApplicationStackOverflowHook().
-constexpr std::uint32_t blinker_stack_words = 256;
-constexpr std::uint32_t request_stack_words = 512;
-constexpr std::uint32_t sampler_stack_words = 512;
-constexpr std::uint32_t transmit_stack_words = 768;
-constexpr std::uint32_t display_stack_words = 768;
+constexpr std::uint32_t blinker_stack_words = 256;  // blinker task gets 256 word (1 KB) stack
+constexpr std::uint32_t request_stack_words = 512;  // request task gets 512 word (2 KB) stack
+constexpr std::uint32_t sampler_stack_words = 512;  // sampler task gets 512 word (2 KB) stack
+constexpr std::uint32_t transmit_stack_words = 768; // transmit task gets 768 word (3 KB) stack
+constexpr std::uint32_t display_stack_words = 768;  // display task gets 768 word (3 KB) stack
 
-StaticTask_t blinker_tcb;
-StackType_t blinker_stack[blinker_stack_words];
+StaticTask_t blinker_tcb; // task control block: FreeRTOS's info about the blinker task (state, priority, etc.)
+StackType_t blinker_stack[blinker_stack_words]; // blinker task's stack, sized by blinker_stack_words (256 words)
 
 // Only one role's tasks are ever created, but both sets of storage are
 // declared so either role compiles from this one file.
-StaticTask_t request_tcb;
-StackType_t request_stack[request_stack_words];
-StaticTask_t sampler_tcb;
-StackType_t sampler_stack[sampler_stack_words];
-StaticTask_t transmit_tcb;
-StackType_t transmit_stack[transmit_stack_words];
+StaticTask_t request_tcb; // request task's control block
+StackType_t request_stack[request_stack_words]; // request task's stack
+StaticTask_t sampler_tcb; // sampler task's control block
+StackType_t sampler_stack[sampler_stack_words]; // sampler task's stack
+StaticTask_t transmit_tcb; // transmit task's control block
+StackType_t transmit_stack[transmit_stack_words]; // transmit task's stack
 
-StaticTask_t display_tcb;
-StackType_t display_stack[display_stack_words];
 
-constexpr std::uint32_t loopback_stack_words = 512;
-StaticTask_t loopback_tcb;
-StackType_t loopback_stack[loopback_stack_words];
-}  // namespace
+StaticTask_t display_tcb; // display task's control block
+StackType_t display_stack[display_stack_words]; // display task's stack
+
+constexpr std::uint32_t loopback_stack_words = 512; // loopback task gets 512 word (2 KB) stack
+StaticTask_t loopback_tcb; // loopback task's control block
+StackType_t loopback_stack[loopback_stack_words]; // loopback task's stack
+}  // namespace                                   
+
 
 // DMA channel 7 has filled the ADC buffer: wake the task asleep in
 // msp432_adc_driver::read(). Interrupt handlers must have external linkage,
@@ -961,24 +968,24 @@ int main()
 {
   WDT_A->CTL = WDT_A_CTL_PW | WDT_A_CTL_HOLD;
 
-  if (debugger_connected()) {
-    initialise_monitor_handles();
-    std::setvbuf(stdout,
-                 semihosting_stdout_buffer.data(),
-                 _IOLBF,
-                 semihosting_stdout_buffer.size());
-    semihosting_ready = true;
+  if (debugger_connected()) { // only set up printing if a debugger is attached
+    initialise_monitor_handles(); // connect printf to the CCS console (semihosting)
+    std::setvbuf(stdout, // give printf output its own buffer
+                 semihosting_stdout_buffer.data(), // use this 256 byte array as the buffer
+                 _IOLBF, // send text when line ends
+                 semihosting_stdout_buffer.size()); // how much room buffer has
+    semihosting_ready = true; // printing is set up so debugger can print
   }
 
   // Both boards talk over eUSCI_A2 at 9600 baud. Static storage: main()'s
   // stack is reused for interrupts once the scheduler starts, so plain
   // locals would be overwritten.
-  lab6::serial::settings uart_settings{};
+  lab6::serial::settings uart_settings{}; // UART settings, starting from the defaults (115200 baud, no parity, 1 stop bit)
   uart_settings.baud_rate = 9'600;
-  static msp432_serial_driver uart(system_clock_hz, uart_settings);
-  configASSERT(uart.ready());
+  static msp432_serial_driver uart(system_clock_hz, uart_settings); // creating UART driver on P3.2/P3.3
+  configASSERT(uart.ready()); // STOP if UART failed to set up
   // Pass the base-class pointer so the void* round trip in each task is exact.
-  static lab6::serial* const serial_interface = &uart;
+  static lab6::serial* const serial_interface = &uart; // pointer to UART that gets passed to the tasks
 
   // LED1 blinking shows that FreeRTOS is scheduling.
   configASSERT(xTaskCreateStatic(blinker_task,
@@ -992,15 +999,18 @@ int main()
   if constexpr (this_device == device_role::sensor) {
     debug_printf("Lab 5 sensor board starting\n");
 
+
     // Synchronization objects must exist before any task that uses them runs.
-    sample_request = xSemaphoreCreateBinaryStatic(&sample_request_storage);
+    sample_request = xSemaphoreCreateBinaryStatic(&sample_request_storage); // creating sample request semaphore in static memory
     configASSERT(sample_request != nullptr);  // created empty (count 0)
 
-    batch_queue = xQueueCreateStatic(batch_queue_length,
-                                     sizeof(temperature_batch),
-                                     batch_queue_storage.data(),
-                                     &batch_queue_control);
-    configASSERT(batch_queue != nullptr);
+// creating batch queue
+
+    batch_queue = xQueueCreateStatic(batch_queue_length, // queue holds 1 batch
+                                     sizeof(temperature_batch), // each item is 128 bytes (64 samples)
+                                     batch_queue_storage.data(), // memory that holds the batch data
+                                     &batch_queue_control); // memory for FreeRTOS's queue memory
+    configASSERT(batch_queue != nullptr); // STOP if queue wan't created
 
     static msp432_adc_driver adc;
     static lab5::adc16_stream* const adc_interface = &adc;
@@ -1015,37 +1025,37 @@ int main()
 
     // Priorities: request > sampler > transmit. transmit busy-waits on UART TX
     // (~140 ms per packet), so it's lowest and the others can preempt it.
-    configASSERT(xTaskCreateStatic(request_task,
-                                   "request",
-                                   request_stack_words,
-                                   serial_interface,
-                                   tskIDLE_PRIORITY + 3,
-                                   request_stack,
-                                   &request_tcb) != nullptr);
-    configASSERT(xTaskCreateStatic(sampler_task,
-                                   "sampler",
-                                   sampler_stack_words,
-                                   adc_interface,
-                                   tskIDLE_PRIORITY + 2,
-                                   sampler_stack,
-                                   &sampler_tcb) != nullptr);
+    configASSERT(xTaskCreateStatic(request_task, // create request task (stop if fails)
+                                   "request", // task name shown in debugger 
+                                   request_stack_words, // stack size (512 words)
+                                   serial_interface, // UART parameter
+                                   tskIDLE_PRIORITY + 3, // priority level of the 3 tasks (high)
+                                   request_stack, // memory for its stack
+                                   &request_tcb) != nullptr); // memory for its control block
+    configASSERT(xTaskCreateStatic(sampler_task, // create sampler task (stop if fails)
+                                   "sampler", // task name shown in debugger
+                                   sampler_stack_words, // stack size (512 words)
+                                   adc_interface, // ADC parameter
+                                   tskIDLE_PRIORITY + 2, // priority level of the 3 tasks (middle)
+                                   sampler_stack, // memory for its stack
+                                   &sampler_tcb) != nullptr); // memory for its control block
     configASSERT(xTaskCreateStatic(
-                   transmit_task,
-                   "transmit",
-                   transmit_stack_words,
-                   const_cast<transmit_task_parameters*>(&transmit_parameters),
-                   tskIDLE_PRIORITY + 1,
-                   transmit_stack,
-                   &transmit_tcb) != nullptr);
+                   transmit_task, // create transmit task (stop if fails)
+                   "transmit", // task name shown in debugger
+                   transmit_stack_words, // stack size (768 words)
+                   const_cast<transmit_task_parameters*>(&transmit_parameters), // struct parameter (UART, clock, button)
+                   tskIDLE_PRIORITY + 1, // priority level of the 3 tasks (low)
+                   transmit_stack, // memory for its stack
+                   &transmit_tcb) != nullptr); // memory for its control block
 
-    if (loopback_test) {
-      configASSERT(xTaskCreateStatic(loopback_request_task,
-                                     "loopback",
-                                     loopback_stack_words,
-                                     serial_interface,
-                                     tskIDLE_PRIORITY + 1,
-                                     loopback_stack,
-                                     &loopback_tcb) != nullptr);
+    if (loopback_test) { // only create in single-board test mode
+      configASSERT(xTaskCreateStatic(loopback_request_task, // create loopback task (stop if fails)
+                                     "loopback", // task name shown in debugger
+                                     loopback_stack_words, // stack size (512 words)
+                                     serial_interface, // UART parameter
+                                     tskIDLE_PRIORITY + 1, // priority level (low, same as transmit)
+                                     loopback_stack, // memory for its stack
+                                     &loopback_tcb) != nullptr); // memory for its control block
     }
   } else {
     debug_printf("Lab 5 display board starting\n");
