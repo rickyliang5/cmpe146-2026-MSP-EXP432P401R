@@ -115,6 +115,14 @@ enum class device_role : std::uint8_t
 // Change this before building each board.
 constexpr device_role this_device = device_role::sensor;
 
+// Single-board test of the sensor role. Set to true, jumper J1.4 (TX) to
+// J1.3 (RX) on the sensor board, and rebuild: a test task then sends the
+// request byte every 2 s, so the UART, ADC, conversion and CRC all run with
+// no display board. The packet itself is not transmitted in this mode,
+// because any 0xA5 byte inside it would loop back as a fake request.
+// Must be false for normal two-board operation.
+constexpr bool loopback_test = false;
+
 // SystemInit leaves MCLK and SMCLK at 3 MHz. The UART baud rate, the ADC
 // sample time and the benchmark clock all assume this.
 constexpr std::uint32_t system_clock_hz = 3'000'000;
@@ -710,16 +718,33 @@ void transmit_task(void* p_parameters)
     }
 
     // 4. Send the samples, then the CRC, least significant byte first.
-    serial.write(sample_view);
-    std::array<std::uint8_t, crc_size> const crc_bytes{
-      static_cast<std::uint8_t>(packet_crc),
-      static_cast<std::uint8_t>(packet_crc >> 8),
-      static_cast<std::uint8_t>(packet_crc >> 16),
-      static_cast<std::uint8_t>(packet_crc >> 24),
-    };
-    serial.write(crc_bytes);
+    if (!loopback_test) {
+      serial.write(sample_view);
+      std::array<std::uint8_t, crc_size> const crc_bytes{
+        static_cast<std::uint8_t>(packet_crc),
+        static_cast<std::uint8_t>(packet_crc >> 8),
+        static_cast<std::uint8_t>(packet_crc >> 16),
+        static_cast<std::uint8_t>(packet_crc >> 24),
+      };
+      serial.write(crc_bytes);
+    }
 
     debug_batches_sent = debug_batches_sent + 1;
+  }
+}
+
+// TEST ONLY: with J1.4 jumpered to J1.3, sends a request byte every 2 s so
+// the whole sensor pipeline can be exercised on one board. Created only when
+// loopback_test is true.
+void loopback_request_task(void* p_parameter)
+{
+  auto& port = *static_cast<lab6::serial*>(p_parameter);
+  std::array<std::uint8_t, 1> const command{ sample_request_command };
+
+  while (true) {
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    debug_printf("loopback: sending request\n");
+    port.write(command);
   }
 }
 
@@ -867,6 +892,10 @@ StackType_t transmit_stack[transmit_stack_words];
 
 StaticTask_t display_tcb;
 StackType_t display_stack[display_stack_words];
+
+constexpr std::uint32_t loopback_stack_words = 512;
+StaticTask_t loopback_tcb;
+StackType_t loopback_stack[loopback_stack_words];
 }  // namespace
 
 // DMA channel 7 has filled the ADC buffer: wake the task asleep in
@@ -970,6 +999,16 @@ int main()
                    tskIDLE_PRIORITY + 1,
                    transmit_stack,
                    &transmit_tcb) != nullptr);
+
+    if (loopback_test) {
+      configASSERT(xTaskCreateStatic(loopback_request_task,
+                                     "loopback",
+                                     loopback_stack_words,
+                                     serial_interface,
+                                     tskIDLE_PRIORITY + 1,
+                                     loopback_stack,
+                                     &loopback_tcb) != nullptr);
+    }
   } else {
     debug_printf("Lab 5 display board starting\n");
 
