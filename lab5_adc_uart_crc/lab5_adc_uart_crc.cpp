@@ -121,7 +121,7 @@ constexpr device_role this_device = device_role::sensor;
 // no display board. The packet itself is not transmitted in this mode,
 // because any 0xA5 byte inside it would loop back as a fake request.
 // Must be false for normal two-board operation.
-constexpr bool loopback_test = true;
+constexpr bool loopback_test = false;
 
 // SystemInit leaves MCLK and SMCLK at 3 MHz. The UART baud rate, the ADC
 // sample time and the benchmark clock all assume this.
@@ -151,7 +151,7 @@ constexpr std::size_t crc_size = sizeof(std::uint32_t);
 constexpr std::size_t packet_size = sample_bytes + crc_size;
 
 /// How long the display board waits for a reply before giving up.
-constexpr TickType_t reply_timeout = pdMS_TO_TICKS(500);
+constexpr TickType_t reply_timeout = pdMS_TO_TICKS(2000);
 
 /// LED color bands, in 0.1 degC: below 20.0 is cold, below 28.0 is warm.
 constexpr std::int32_t warm_tenths = 200;
@@ -210,15 +210,14 @@ public:
 
     // ADC clocked from MCLK (3 MHz), unsigned 14-bit results.
     ADC14_enableModule();
-    ADC14_initModule(ADC_CLOCKSOURCE_MCLK,
+    ADC14_initModule(ADC_CLOCKSOURCE_SMCLK,
                      ADC_PREDIVIDER_1,
                      ADC_DIVIDER_1,
                      ADC_NOROUTE);
     ADC14_setResolution(ADC_14BIT);
     ADC14_setResultFormat(ADC_UNSIGNED_BINARY);
 
-    // Conversion memory 0 measures A14 against the internal reference, and is
-    // converted repeatedly once triggered.
+
     ADC14_configureSingleSampleMode(ADC_MEM0, true);
     ADC14_configureConversionMemory(ADC_MEM0,
                                     ADC_VREFPOS_INTBUF_VREFNEG_VSS,
@@ -227,7 +226,19 @@ public:
 
     // 64 ADC clocks = 21 us of sample time at 3 MHz, comfortably longer than
     // the ADC14 needs for a low-impedance source like the TMP36.
-    ADC14_setSampleHoldTime(ADC_PULSE_WIDTH_64, ADC_PULSE_WIDTH_64);
+    //
+    // Minimum sample time, 200 ohm case:
+    //   (200 + 1000) x 15 pF        = 18 ns
+    //   200 x (10 pF + 5 pF)        =  3 ns
+    //                           sum = 21 ns
+    //   tsample >= 10.4 x 21 ns = 218 ns ~= 0.22 us
+    //
+    // Minimum sample time, 600 ohm case:
+    //   (600 + 1000) x 15 pF        = 24 ns
+    //   600 x (10 pF + 5 pF)        =  9 ns
+    //                           sum = 33 ns
+    //   tsample >= 10.4 x 33 ns = 343 ns ~= 0.34 us
+    ADC14_setSampleHoldTime(ADC_PULSE_WIDTH_4, ADC_PULSE_WIDTH_4);
 
     // Start each conversion automatically when the previous one finishes.
     ADC14_enableSampleTimer(ADC_AUTOMATIC_ITERATION);
