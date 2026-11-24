@@ -3,79 +3,81 @@
 #include <cstdio>
 
 #include <cstdint>
-#include <cstdlib>
 
-#include "../hal/gpio.hpp"
 #include "../hal/timer.hpp"
 #include "../hal/timer_util.hpp"
+#include "lab2_timer.hpp"
 
-// Routes std::printf output to the CCS Console over JTAG semihosting.
-// Requires the debugger to stay connected and running - output is lost if
-// you disconnect or power-cycle the board instead of debugging it live.
 extern "C" void initialise_monitor_handles(void);
 
-// Test double for lab2::steady_clock. Does not touch real hardware - it just
-// increments a counter every time uptime() is called, as if a timer tick had
-// elapsed. Useful for exercising delay logic before your real Timer_A-backed
-// steady_clock exists.
-class fake_steady_clock : public lab2::steady_clock
+namespace {
+
+constexpr std::uint16_t full_scale = 65535;
+
+constexpr std::uint32_t pwm_frequency = 1'000;
+
+/// Steps in one leg of the wheel. Three legs make a full revolution.
+constexpr std::uint16_t steps_per_leg = 256;
+constexpr std::uint16_t phase_count = steps_per_leg * 3;
+
+/// Time spent on each step. At 10 ms a revolution takes about 7.7 seconds,
+/// and 100 updates per second is well past the point the eye sees stepping.
+constexpr auto step_duration = std::chrono::milliseconds(10);
+
+/// Brightness of the three channels at one point on the wheel.
+struct rgb_level
 {
-public:
-  fake_steady_clock() = default;
-
-private:
-  std::uint32_t driver_frequency() override
-  {
-    // Use a small frequency to reduce the amount of ticks needed
-    // for the delay function.
-    return 100'000;
-  }
-
-  std::uint64_t driver_uptime() override
-  {
-    return m_count++;
-  }
-
-  std::uint64_t m_count = 0;
+  std::uint16_t red;
+  std::uint16_t green;
+  std::uint16_t blue;
 };
+
+constexpr rgb_level color_wheel(std::uint16_t p_phase)
+{
+  auto const leg = p_phase / steps_per_leg;
+  auto const step = p_phase % steps_per_leg;
+
+  auto const rising = static_cast<std::uint16_t>(step * 257);
+  auto const falling = static_cast<std::uint16_t>(full_scale - rising);
+
+  switch (leg) {
+    case 0:
+      return { falling, rising, 0 };
+    case 1:
+      return { 0, falling, rising };
+    default:
+      return { rising, 0, falling };
+  }
+}
+
+}
 
 int main()
 {
-  using namespace std::chrono_literals;
 
-  // Stop the watchdog timer. Without this, the device resets a few seconds
-  // after boot. This is the only DriverLib call allowed in this lab - it is
-  // boilerplate, not part of the drivers you are writing.
   MAP_WDT_A_holdTimer();
 
   initialise_monitor_handles();
 
-  std::printf("Hello, World\n");
+  timer_a_clock clock;
 
-  // TODO(lab2, step 1): Implement lab2::steady_clock
+  configure_rgb_pwm_pins();
 
-  // TODO(lab2, step 2): Pass your steady clock to lab2::delay() from
-  // hal/timer_util.hpp and test it with printf or blinking an LED - your
-  // choice. Put a printf on either side of the delay and confirm the gap
-  // between them matches the duration you asked for. If a 1s delay is not
-  // taking 1 second, your frequency() is wrong.
+  timer_a_pwm red{ 1, pwm_frequency };
+  timer_a_pwm green{ 3, pwm_frequency };
+  timer_a_pwm blue{ 4, pwm_frequency };
 
-  // TODO(lab2, step3): Implement lab2::pwm using what you learned from
-  // lab2::steady_clock
-
-  // TODO(lab2, step4): Test against an LED and see if you can control the
-  // brightness
-  fake_steady_clock clock;
+  std::uint16_t phase = 0;
 
   while (true) {
-    lab2::delay(clock, 1s);
-    std::printf("Sleep 1\n");
-    lab2::delay(clock, 1s);
-    std::printf("Sleep 2\n");
-    lab2::delay(clock, 1s);
-    std::printf("Sleep 3\n");
-    // TODO(lab2, step 5): Use the steady clock together with your PWM driver to
-    // animate the RGB LED as a continuous color wheel, as described in
-    // README.md.
+    auto const level = color_wheel(phase);
+
+    red.duty_cycle(level.red);
+    green.duty_cycle(level.green);
+    blue.duty_cycle(level.blue);
+
+    phase = static_cast<std::uint16_t>((phase + 1) % phase_count);
+
+    lab2::delay(clock, step_duration);
   }
 }
